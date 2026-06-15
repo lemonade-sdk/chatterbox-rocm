@@ -97,12 +97,12 @@ jobs:
           - os: windows-latest
             platform: windows-x64
             device: cpu
-            archive: zip
+            archive: tar.gz
             torch_index: https://download.pytorch.org/whl/cpu
           - os: windows-latest
             platform: windows-x64
             device: cuda
-            archive: zip
+            archive: tar.gz
             torch_index: https://download.pytorch.org/whl/cu124
           # macOS arm64 (default wheel ships both CPU and MPS/Metal support)
           - os: macos-latest
@@ -171,23 +171,49 @@ jobs:
           ./dist/chatterbox-server/chatterbox-server --help || \
           ./dist/chatterbox-server/chatterbox-server.exe --help
 
-      - name: Package asset
+      - name: Package asset (tar.gz, split if over GitHub's 2 GiB limit)
         shell: bash
         env:
           TAG: ${{ needs.check.outputs.tag }}
-          ARCHIVE: ${{ matrix.archive }}
           PLATFORM: ${{ matrix.platform }}
           DEVICE: ${{ matrix.device }}
         run: |
           set -euo pipefail
-          ASSET="chatterbox-server-${TAG}-${PLATFORM}-${DEVICE}.${ARCHIVE}"
-          cd dist
-          if [ "${ARCHIVE}" = "zip" ]; then
-            7z a "../${ASSET}" chatterbox-server
+          # All platforms use .tar.gz; Lemonade extracts it via native tar on
+          # Windows too. base matches ChatterboxServer::get_install_params()
+          # (filename minus ".tar.gz").
+          BASE="chatterbox-server-${TAG}-${PLATFORM}-${DEVICE}"
+          TARBALL="${BASE}.tar.gz"
+          tar -czf "${TARBALL}" -C dist chatterbox-server
+
+          # GitHub release assets are capped at 2 GiB each. GPU bundles (full
+          # torch + CUDA/ROCm libs) exceed that, so split into raw byte parts
+          # named {base}.partNN-of-MM.tar.gz + a {base}.partcount manifest —
+          # the format Lemonade's split-archive installer reassembles.
+          LIMIT=$((1900 * 1024 * 1024))   # 1900 MiB, comfortably under 2 GiB
+          SIZE=$(wc -c < "${TARBALL}")
+          : > uploads.txt
+          if [ "${SIZE}" -gt "${LIMIT}" ]; then
+            split -b "${LIMIT}" -d -a 2 "${TARBALL}" "${BASE}.rawpart"
+            mapfile -t PARTS < <(ls "${BASE}".rawpart* | sort)
+            N=${#PARTS[@]}
+            NN=$(printf '%02d' "${N}")
+            i=1
+            for p in "${PARTS[@]}"; do
+              II=$(printf '%02d' "${i}")
+              mv "${p}" "${BASE}.part${II}-of-${NN}.tar.gz"
+              echo "${BASE}.part${II}-of-${NN}.tar.gz" >> uploads.txt
+              i=$((i + 1))
+            done
+            printf '%s\n' "${N}" > "${BASE}.partcount"
+            echo "${BASE}.partcount" >> uploads.txt
+            rm -f "${TARBALL}"
+            echo "Split ${TARBALL} (${SIZE} bytes) into ${N} parts"
           else
-            tar -czf "../${ASSET}" chatterbox-server
+            echo "${TARBALL}" >> uploads.txt
+            echo "Single asset ${TARBALL} (${SIZE} bytes)"
           fi
-          echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
+          cat uploads.txt
 
       - name: Publish to release
         shell: bash
@@ -200,7 +226,10 @@ jobs:
             gh release create "$TAG" \
               --repo "${{ github.repository }}" \
               --title "chatterbox-server $TAG" \
-              --notes "Self-contained chatterbox-server bundles (chatterbox-tts ${{ needs.check.outputs.version }}) for Lemonade's chatterbox TTS backend. One asset per platform/device (cuda/rocm/metal/cpu)." \
+              --notes "Self-contained chatterbox-server bundles (chatterbox-tts ${{ needs.check.outputs.version }}) for Lemonade's chatterbox TTS backend. One asset per platform/device (cuda/rocm/metal/cpu); multi-GB GPU bundles are split into .partNN-of-MM.tar.gz + .partcount." \
               || true
           fi
-          gh release upload "$TAG" "$ASSET" --repo "${{ github.repository }}" --clobber
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            gh release upload "$TAG" "$f" --repo "${{ github.repository }}" --clobber
+          done < uploads.txt
