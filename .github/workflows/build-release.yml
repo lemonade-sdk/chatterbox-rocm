@@ -1,0 +1,206 @@
+name: build-release
+
+# Builds self-contained chatterbox-server bundles consumed by Lemonade's
+# `chatterbox` text-to-speech backend. No Chatterbox code is forked: at build
+# time `chatterbox-tts` is installed from PyPI, the device-appropriate PyTorch
+# wheel is installed over it, and the thin `main.py` wrapper is checked out from
+# lemonade-sdk/lemonade, then all three are frozen into a PyInstaller onedir
+# bundle with an embedded Python runtime.
+#
+# One bundle is published per (platform, device) — assets are named to match
+# ChatterboxServer::get_install_params() in lemonade:
+#   chatterbox-server-<tag>-<platform>-<device>.<ext>
+
+on:
+  schedule:
+    - cron: '23 6 * * *'   # daily — poll PyPI for new chatterbox-tts releases
+  workflow_dispatch:
+    inputs:
+      chatterbox_version:
+        description: 'chatterbox-tts version (empty = latest on PyPI)'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild even if the release already exists'
+        type: boolean
+        default: false
+      lemonade_ref:
+        description: 'lemonade-sdk/lemonade ref for the main.py wrapper'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      need_build: ${{ steps.resolve.outputs.need_build }}
+    steps:
+      - name: Resolve version and tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LEMONADE_REF: ${{ github.event.inputs.lemonade_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.event.inputs.chatterbox_version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(curl -fsSL https://pypi.org/pypi/chatterbox-tts/json | jq -r '.info.version')
+          fi
+          TAG="chatterbox${VERSION}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+
+          NEED=true
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            if [ "${{ github.event.inputs.force }}" != "true" ]; then
+              NEED=false
+            fi
+          fi
+
+          # Confirm the wrapper exists at the requested lemonade ref.
+          if ! gh api "repos/lemonade-sdk/lemonade/contents/tools/chatterbox-server/main.py?ref=${LEMONADE_REF}" >/dev/null 2>&1; then
+            echo "::warning::tools/chatterbox-server/main.py not found at lemonade ref ${LEMONADE_REF}"
+          fi
+
+          echo "need_build=$NEED" >> "$GITHUB_OUTPUT"
+          echo "Resolved chatterbox-tts $VERSION -> tag $TAG (need_build=$NEED)"
+
+  build:
+    needs: check
+    if: needs.check.outputs.need_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x64
+          - os: ubuntu-22.04
+            platform: linux-x64
+            device: cpu
+            archive: tar.gz
+            torch_index: https://download.pytorch.org/whl/cpu
+          - os: ubuntu-22.04
+            platform: linux-x64
+            device: cuda
+            archive: tar.gz
+            torch_index: https://download.pytorch.org/whl/cu124
+          - os: ubuntu-22.04
+            platform: linux-x64
+            device: rocm
+            archive: tar.gz
+            torch_index: https://download.pytorch.org/whl/rocm6.2
+          # Windows x64
+          - os: windows-latest
+            platform: windows-x64
+            device: cpu
+            archive: zip
+            torch_index: https://download.pytorch.org/whl/cpu
+          - os: windows-latest
+            platform: windows-x64
+            device: cuda
+            archive: zip
+            torch_index: https://download.pytorch.org/whl/cu124
+          # macOS arm64 (default wheel ships both CPU and MPS/Metal support)
+          - os: macos-latest
+            platform: macos-arm64
+            device: cpu
+            archive: tar.gz
+            torch_index: ''
+          - os: macos-latest
+            platform: macos-arm64
+            device: metal
+            archive: tar.gz
+            torch_index: ''
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout lemonade wrapper (tools/chatterbox-server)
+        uses: actions/checkout@v4
+        with:
+          repository: lemonade-sdk/lemonade
+          ref: ${{ github.event.inputs.lemonade_ref || 'main' }}
+          sparse-checkout: tools/chatterbox-server
+          path: lemonade
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: bash
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          TORCH_INDEX: ${{ matrix.torch_index }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # Install chatterbox-tts first, then pin the device-specific torch
+          # wheel over whatever it pulled in.
+          python -m pip install "chatterbox-tts==${VERSION}"
+          if [ -n "${TORCH_INDEX}" ]; then
+            python -m pip install --force-reinstall torch==2.6.0 torchaudio==2.6.0 --index-url "${TORCH_INDEX}"
+          fi
+          # Audio encoders for the wrapper (mp3 streaming + flac/opus).
+          python -m pip install lameenc soundfile pyinstaller
+          python -c "import torch, chatterbox; print('torch', torch.__version__)"
+
+      - name: Build with PyInstaller (onedir)
+        shell: bash
+        run: |
+          set -euo pipefail
+          pyinstaller --noconfirm --onedir --name chatterbox-server \
+            --collect-all torch \
+            --collect-all torchaudio \
+            --collect-all chatterbox \
+            --collect-all transformers \
+            --collect-all diffusers \
+            --collect-all tokenizers \
+            --collect-all safetensors \
+            --collect-all librosa \
+            --collect-all soundfile \
+            --hidden-import lameenc \
+            lemonade/tools/chatterbox-server/main.py
+
+      - name: Smoke test (--help)
+        shell: bash
+        run: |
+          ./dist/chatterbox-server/chatterbox-server --help || \
+          ./dist/chatterbox-server/chatterbox-server.exe --help
+
+      - name: Package asset
+        shell: bash
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          ARCHIVE: ${{ matrix.archive }}
+          PLATFORM: ${{ matrix.platform }}
+          DEVICE: ${{ matrix.device }}
+        run: |
+          set -euo pipefail
+          ASSET="chatterbox-server-${TAG}-${PLATFORM}-${DEVICE}.${ARCHIVE}"
+          cd dist
+          if [ "${ARCHIVE}" = "zip" ]; then
+            7z a "../${ASSET}" chatterbox-server
+          else
+            tar -czf "../${ASSET}" chatterbox-server
+          fi
+          echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
+
+      - name: Publish to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "chatterbox-server $TAG" \
+              --notes "Self-contained chatterbox-server bundles (chatterbox-tts ${{ needs.check.outputs.version }}) for Lemonade's chatterbox TTS backend. One asset per platform/device (cuda/rocm/metal/cpu)." \
+              || true
+          fi
+          gh release upload "$TAG" "$ASSET" --repo "${{ github.repository }}" --clobber
