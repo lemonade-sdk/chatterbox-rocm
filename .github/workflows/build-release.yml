@@ -92,7 +92,7 @@ jobs:
             platform: linux-x64
             device: rocm
             archive: tar.gz
-            torch_index: https://download.pytorch.org/whl/rocm6.2
+            torch_index: https://download.pytorch.org/whl/rocm6.2.4
           # Windows x64
           - os: windows-latest
             platform: windows-x64
