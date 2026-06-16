@@ -15,8 +15,8 @@ on:
         description: 'chatterbox-tts version'
         default: '0.1.7'
       torch_version:
-        description: 'torch version to force over the pin'
-        default: '2.12.0'
+        description: 'torch (and torchaudio) version to force over the pin'
+        default: '2.11.0'
       torch_index:
         description: 'PyTorch wheel index'
         default: 'https://download.pytorch.org/whl/rocm7.2'
@@ -38,27 +38,46 @@ jobs:
           # Install chatterbox first, then force the newer torch over its pin.
           python -m pip install "chatterbox-tts==${{ inputs.chatterbox_version }}"
           python -m pip install --force-reinstall \
-            "torch==${{ inputs.torch_version }}" torchaudio \
+            "torch==${{ inputs.torch_version }}" "torchaudio==${{ inputs.torch_version }}" \
             --index-url "${{ inputs.torch_index }}"
           echo "=== resolved versions ==="
           python -c "import torch, torchaudio; print('torch', torch.__version__, '| torchaudio', torchaudio.__version__)"
           echo "=== pip check (dependency conflicts) ==="
           python -m pip check || true
 
-      - name: Import + CPU generate (API compatibility)
+      - name: Import + CPU generate + voice-clone (API compatibility)
         shell: bash
         run: |
           set -euxo pipefail
+          # Mirror exactly what tools/chatterbox-server/main.py does: convert the
+          # generated tensor to PCM/WAV with numpy + the stdlib wave module — NO
+          # torchaudio (whose 2.11+ save/load now needs TorchCodec). Chatterbox
+          # itself loads prompts via librosa, so this is a faithful compat test.
           python - <<'PY'
-          import torch, torchaudio as ta
+          import numpy as np, wave, torch
           from chatterbox.tts import ChatterboxTTS
           print("torch", torch.__version__)
+
+          def to_wav(wav, path, sr):
+              if hasattr(wav, "detach"):
+                  wav = wav.detach().cpu().float().numpy()
+              a = np.clip(np.asarray(wav, dtype=np.float32).reshape(-1), -1.0, 1.0)
+              pcm = (a * 32767.0).astype("<i2").tobytes()
+              with wave.open(path, "wb") as w:
+                  w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(pcm)
+
           # device="cpu": the ROCm wheel runs CPU ops even without an AMD GPU,
-          # so this validates Chatterbox's code against the newer torch API.
+          # validating Chatterbox's code against the newer torch API.
           model = ChatterboxTTS.from_pretrained(device="cpu")
           wav = model.generate("Chatterbox running on a newer PyTorch.")
-          ta.save("out.wav", wav, model.sr)
-          print("OK: generated", tuple(wav.shape), "@", model.sr, "Hz")
+          to_wav(wav, "ref.wav", model.sr)
+          print("default-voice OK:", tuple(wav.shape), "@", model.sr, "Hz")
+
+          # Voice-clone path exercises librosa.load of a reference prompt.
+          wav2 = model.generate("Cloned voice on ROCm 7.2.", audio_prompt_path="ref.wav")
+          to_wav(wav2, "clone.wav", model.sr)
+          print("voice-clone OK:", tuple(wav2.shape))
+          print("ALL OK on torch", torch.__version__)
           PY
 
       - name: Report
