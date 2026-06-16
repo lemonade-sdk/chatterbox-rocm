@@ -92,7 +92,11 @@ jobs:
             platform: linux-x64
             device: rocm
             archive: tar.gz
-            torch_index: https://download.pytorch.org/whl/rocm6.2.4
+            # torch 2.6.0 (chatterbox's pin) only has rocm6.1/6.2.4 wheels.
+            # chatterbox is verified API-compatible with torch 2.11.0, whose
+            # rocm7.2 wheels add RDNA4 / newer-GPU support (see test-rocm72.yml).
+            torch_index: https://download.pytorch.org/whl/rocm7.2
+            torch_ver: '2.11.0'
           # Windows x64
           - os: windows-latest
             platform: windows-x64
@@ -135,6 +139,9 @@ jobs:
         env:
           VERSION: ${{ needs.check.outputs.version }}
           TORCH_INDEX: ${{ matrix.torch_index }}
+          # Defaults to chatterbox's pinned torch; rocm overrides to 2.11.0
+          # (the version with rocm7.2 wheels, verified compatible).
+          TORCH_VER: ${{ matrix.torch_ver || '2.6.0' }}
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
@@ -142,7 +149,7 @@ jobs:
           # wheel over whatever it pulled in.
           python -m pip install "chatterbox-tts==${VERSION}"
           if [ -n "${TORCH_INDEX}" ]; then
-            python -m pip install --force-reinstall torch==2.6.0 torchaudio==2.6.0 --index-url "${TORCH_INDEX}"
+            python -m pip install --force-reinstall "torch==${TORCH_VER}" "torchaudio==${TORCH_VER}" --index-url "${TORCH_INDEX}"
           fi
           # Audio encoders for the wrapper (mp3 streaming + flac/opus).
           python -m pip install lameenc soundfile pyinstaller
