@@ -1,0 +1,66 @@
+name: test-rocm72
+
+# Experimental: does chatterbox-tts run on a newer PyTorch that has ROCm 7.2
+# wheels? chatterbox-tts hard-pins torch==2.6.0 (ROCm 6.1/6.2.4 only). ROCm 7.2
+# wheels start at torch 2.11/2.12, so we must override the pin. CI runners have
+# no AMD GPU, but the ROCm wheel runs CPU ops fine — a device="cpu" generate
+# exercises whether Chatterbox's code is API-compatible with the newer torch
+# (the real risk). If this passes, the rocm bundle in build-release.yml can be
+# switched to the 7.2 index.
+
+on:
+  workflow_dispatch:
+    inputs:
+      chatterbox_version:
+        description: 'chatterbox-tts version'
+        default: '0.1.7'
+      torch_version:
+        description: 'torch version to force over the pin'
+        default: '2.12.0'
+      torch_index:
+        description: 'PyTorch wheel index'
+        default: 'https://download.pytorch.org/whl/rocm7.2'
+
+jobs:
+  compat:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install chatterbox-tts + newer torch (ROCm 7.2)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          # Install chatterbox first, then force the newer torch over its pin.
+          python -m pip install "chatterbox-tts==${{ inputs.chatterbox_version }}"
+          python -m pip install --force-reinstall \
+            "torch==${{ inputs.torch_version }}" torchaudio \
+            --index-url "${{ inputs.torch_index }}"
+          echo "=== resolved versions ==="
+          python -c "import torch, torchaudio; print('torch', torch.__version__, '| torchaudio', torchaudio.__version__)"
+          echo "=== pip check (dependency conflicts) ==="
+          python -m pip check || true
+
+      - name: Import + CPU generate (API compatibility)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import torch, torchaudio as ta
+          from chatterbox.tts import ChatterboxTTS
+          print("torch", torch.__version__)
+          # device="cpu": the ROCm wheel runs CPU ops even without an AMD GPU,
+          # so this validates Chatterbox's code against the newer torch API.
+          model = ChatterboxTTS.from_pretrained(device="cpu")
+          wav = model.generate("Chatterbox running on a newer PyTorch.")
+          ta.save("out.wav", wav, model.sr)
+          print("OK: generated", tuple(wav.shape), "@", model.sr, "Hz")
+          PY
+
+      - name: Report
+        if: always()
+        run: echo "If the previous step passed, chatterbox-tts is API-compatible with torch ${{ inputs.torch_version }} (ROCm 7.2) — safe to switch the rocm bundle."
